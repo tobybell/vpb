@@ -744,15 +744,135 @@ to communication errors.
 
 Testing was performed by Toby Bell and Jonathan Vollrath on Monday, 16 Sep 2024.
 The test procedure was authored by Toby Bell and carried out successfully by
-Jonathan Vollrath at Georgia Tech, with Toby monitoring remotely via Zoom at
-Stanford University.
+Jonathan Vollrath at Georgia Tech SSDL, with Toby monitoring remotely via Zoom
+at the Stanford Space Rendezvous Laboratory.
 
 The [test procedure and record can be found here](testing-2024-09-16.pdf).
 
+## VISORS Operations Concept
+
+During the VISORS operations phase, using the VISORS propulsion bootloader
+would likely require the following:
+
+1. Compile the updated VISORS propulsion application softare (CGTC)
+2. Convert the resulting application binary to bootloader commands
+3. Upload those commands to the spacecraft
+4. Power-cycle the propulsion system
+5. Within 2 seconds of power-cycle, send the bootloader commands to the
+   propulsion system over UART
+6. Check propulsion telemetry to confirm that all pages were written, and
+   re-transmit any failed pages if needed
+
+Step 2 can be accomplished using the `visors-prop-boot-encode.py` script.
+Step 6 can be accomplished using the `visors-prop-boot-decode.py` script.
+
+Performing steps 5 and 6 without expiring the 2-second bootloader timer would
+require either writing a separate program to run on the BCT bus that can manage
+the power-cycle/page-write/telemetry verification process automatically
+(preferred), or, if that's not possible, include the TIMEOUT_DISABLE bootloader
+command in the uploaded sequence to allow verifying telemetry by human
+operators, potentially across multiple ground passes, before exiting the
+bootloader with the EXIT command.
+
+### Avoiding running corrupted applications
+
+If communication or power is interrupted during an application software load,
+the application will likely be left in a corrupted state. This is not a
+permanent problem, since the bootloader can be restarted by power-cylcing the
+device, and page-write commands can be re-attempted. If the application is
+corrupted, it most likely won't run. However, there's a small chance the
+application could be left in a state in which it still can execute but has
+undesirable behavior (for example, firing the thrusters in an infinite loop).
+To avoid this, the author recommends the following write strategy when writing
+new application software pages:
+
+1. Write an intentionally invalid page (e.g. 0xFF 0xFF 0xFF 0xFF...) to page 0
+2. Write the rest of the software pages (1...N)
+3. Read-back pages 1...N to check they are correct & re-transmit if wrong
+4. Finally, write the real page 0 contents; read-back & re-transmit if wrong
+
+Erasing page 0 before writing the rest of the pages ensures that if the
+application tries to start executing it will fail and jump back to the
+bootloader.
+
+## Mission Risk
+
+The VISORS propulsion bootloader aims to decrease mission risk by enabling
+unknown defects in propulsion application software to be identified and resolved
+after launch. However, its ability to do this depends on the bootloader itself
+being correct. A defective bootloader may prevent successful application
+software updates. Moreover, since the bootloader is the first code to run and
+must voluntarily pass control to the application software, if the bootloader
+itself contains defects in its logic for starting the application, it may
+make the propulsion application software permamently unusable.
+
+The three biggest risks introduced by the bootloader, according to the author,
+are:
+
+1. **Boot loop.** The bootloader uses the device's built-in watchdog timer to
+   automatically reboot the device after 2 seconds of inactivity, which is meant
+   to start the application. Since the bootloader always runs first, this means
+   that the watchdog timer does not directly cause the application to start, but
+   merely causes the bootloader to restart. The bootloader contains logic to
+   detect whether a given boot was caused by the watchdog or by an external
+   source, and, if it was caused by the watchdog, it will then start the
+   application. If this logic is flawed, and the bootloader fails for any reason
+   to detect the watchdog reset, it could result in a boot loop, where the
+   bootloader simply reboots itself every 2 seconds, but never starts the
+   application.
+      - Mitigation: the bootloader contains an explicit EXIT command that be
+        sent by the bus to manually tell it to start the application. As long as
+        this command works, a scenario causing a bootloop can be worked
+        around by sending this command when powering on the
+        propulsion system. If the EXIT command also fails due to an
+        independent defect, the boot loop would be inescapable.
+      - Mitigation: testing and analysis. The bootloader logic for detecting
+        watchdog reset and jumping to the application, and for the EXIT command,
+        should be reviewed by a separate party, referring to the [ATmega128 datasheet](
+        http://ww1.microchip.com/downloads/en/devicedoc/doc2467.pdf). It has
+        been tested and shown to work successfully in [testing-2024-09-16.pdf](
+        testing-2024-09-16.pdf), but a separate party should review the test
+        procedure and record, and possibly perform additional testing.
+2. **Application corruption.** If the bootloader contains a defect that results
+   in it consistently writing application flash memory incorrectly, it
+   could mean that we are unable to load correct application software onto the
+   device.
+      - Mitigation: testing and analysis. A separate party should review the
+        code responsible for writing to flash memory for correctness. It has
+        been tested and shown to work successfully in [testing-2024-09-16.pdf](
+        testing-2024-09-16.pdf), but a separate party should review the test
+        procedure and record, and possibly perform additional testing.
+      - Mitigation: workaround in application software. If the bootloader is
+        discovered post-launch to consistently corrupt certain bytes of the
+        application software, the application software could be
+        designed with instructions to jump over executing those bytes.
+3. **Bricking the device.** Because the bootloader contains instructions with
+   the ability to modify the contents of any flash page, the bootloader can
+   technically update itself. There is nothing inherently wrong with this if
+   done correctly, and it could be a useful capability in case defects
+   are discovered in the bootloader after launch. However, doing this is
+   much higher risk than updating the application software. If anything goes
+   wrong while updating the bootloader, it could leave the bootloader in a state
+   where it is unable to acccept commands or perform any further actions, at
+   which point the propulsion system would likely be permanently unusable.
+      - Mitigation: it's possible to disable the bootloader's ability to
+        update itself at a hardware level. By setting a "fuse" on the device
+        when programming the bootloader, the flash pages containing the
+        bootloader can be permanently locked for writing, guaranteeing that the
+        bootloader can never corrupt itself. Doing this would also mean the
+        bootloader could not be patched. This might be the most desirable option
+        the bootloader is reviewed and tested thoroughly, and we believe it is
+        correct.
+      - Mitigation: document the risks of updating the bootloader, and put
+        software safeguards in place in ground software to ensure it's not done
+        carelessly. For example, the `visors-prop-boot-encode.py` script
+        contains a check to ensure that no bootloader pages are written during a
+        regular propulsion application software update.
+
 ## Acknowledgement
 
-The author, Toby Bell, would like to express his utmost gratitude to the
-creator Michael Pollet and other maintainers of
+The author, Toby Bell, Space Rendezvous Laboratory, would like to express his
+utmost gratitude to the creator Michael Pollet and other maintainers of
 [SimAVR](https://github.com/buserror/simavr). The VISORS propulsion bootloader
 was developed in a very short timeframe in order to be ready for propulsion
 system integration—about 3 days. Since no ATmega128 hardware was available to
